@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const http = require("http");
 const {
   Client,
   GatewayIntentBits,
@@ -17,9 +18,7 @@ const path = require("path");
 
 // ---- Basic config ----
 
-// Role IDs (optional) that are allowed to run mod commands.
-// If you want to rely purely on permissions (ManageGuild), leave this array empty
-// and give your Skirmish mods the appropriate Discord permissions instead.
+// Optional: role IDs allowed to run mod commands in addition to Manage Guild permission.
 const MOD_ROLE_IDS = [
   // "123456789012345678"
 ];
@@ -440,6 +439,18 @@ async function handleList(interaction) {
     ephemeral: true
   });
 }
+
+// ---- Tiny HTTP server for Render ----
+
+const PORT = process.env.PORT || 3000;
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("RAD Event Bot is running.\n");
+  })
+  .listen(PORT, () => {
+    console.log(`HTTP server listening on port ${PORT}`);
+  });
 
 // ---- Start bot ----
 
