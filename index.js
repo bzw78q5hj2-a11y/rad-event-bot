@@ -23,7 +23,7 @@ const path = require("path");
 
 // Optional: role IDs allowed to run mod commands in addition to Manage Guild permission.
 const MOD_ROLE_IDS = [
-  // "123456789012345678"
+  // "1431337802368417854"
 ];
 
 // Path for persistent data
@@ -108,7 +108,7 @@ const commands = [
     .addSubcommand(sub =>
       sub
         .setName("submit")
-        .setDescription("Submit your Piltover deck link for this Summoner Skirmish.")
+        .setDescription("Submit your Piltover Archive deck link for this Summoner Skirmish.")
         .addStringOption(opt =>
           opt
             .setName("link")
