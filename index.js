@@ -11,7 +11,10 @@ const {
   PermissionFlagsBits,
   ChannelType,
   EmbedBuilder,
-  Events
+  Events,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle
 } = require("discord.js");
 const fs = require("fs");
 const path = require("path");
@@ -158,6 +161,11 @@ const commands = [
             .setRequired(true)
         )
     )
+    .addSubcommand(sub =>
+      sub
+        .setName("clear")
+        .setDescription("Clear ALL tracked Skirmish submissions. (Mods only)")
+    )
 ].map(cmd => cmd.toJSON());
 
 // ---- Command registration ----
@@ -222,40 +230,45 @@ client.once(Events.ClientReady, () => {
 });
 
 client.on(Events.InteractionCreate, async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-
   try {
-    if (interaction.commandName !== "skirmish") return;
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName !== "skirmish") return;
 
-    const sub = interaction.options.getSubcommand();
+      const sub = interaction.options.getSubcommand();
 
-    switch (sub) {
-      case "connect":
-        await handleConnect(interaction);
-        break;
-      case "submit":
-        await handleSubmit(interaction);
-        break;
-      case "setsubmissions":
-        await handleSetSubmissions(interaction);
-        break;
-      case "list":
-        await handleList(interaction);
-        break;
-      case "reviewed":
-        await handleReviewed(interaction);
-        break;
-      case "remove":
-        await handleRemove(interaction);
-        break;
-      default:
-        break;
+      switch (sub) {
+        case "connect":
+          await handleConnect(interaction);
+          break;
+        case "submit":
+          await handleSubmit(interaction);
+          break;
+        case "setsubmissions":
+          await handleSetSubmissions(interaction);
+          break;
+        case "list":
+          await handleList(interaction);
+          break;
+        case "reviewed":
+          await handleReviewed(interaction);
+          break;
+        case "remove":
+          await handleRemove(interaction);
+          break;
+        case "clear":
+          await handleClear(interaction);
+          break;
+        default:
+          break;
+      }
+    } else if (interaction.isButton()) {
+      await handleButton(interaction);
     }
   } catch (err) {
     console.error("Interaction error:", err);
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({
-        content: "Something went wrong handling that command.",
+        content: "Something went wrong handling that interaction.",
         ephemeral: true
       });
     }
@@ -424,6 +437,80 @@ async function handleRemove(interaction) {
   });
 }
 
+// /skirmish clear – ask for confirmation with buttons
+async function handleClear(interaction) {
+  if (!isMod(interaction)) {
+    await interaction.reply({
+      content: "You don’t have permission to clear Skirmish data.",
+      ephemeral: true
+    });
+    return;
+  }
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`skirmish_clear_confirm_${interaction.user.id}`)
+      .setLabel("Confirm")
+      .setEmoji("✅")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`skirmish_clear_cancel_${interaction.user.id}`)
+      .setLabel("Cancel")
+      .setEmoji("❌")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await interaction.reply({
+    content:
+      "This will clear **all tracked players and deck submissions** for the current Skirmish.\nAre you sure you want to do this?",
+    components: [row],
+    ephemeral: true
+  });
+}
+
+// Handle clear confirmation buttons
+async function handleButton(interaction) {
+  const id = interaction.customId;
+
+  if (!id.startsWith("skirmish_clear_")) return;
+
+  const parts = id.split("_"); // ["skirmish","clear","confirm","<userId>"]
+  const action = parts[2];
+  const ownerId = parts[3];
+
+  if (interaction.user.id !== ownerId) {
+    await interaction.reply({
+      content: "You didn’t start this clear action.",
+      ephemeral: true
+    });
+    return;
+  }
+
+  if (!isMod(interaction)) {
+    await interaction.reply({
+      content: "You don’t have permission to clear Skirmish data.",
+      ephemeral: true
+    });
+    return;
+  }
+
+  if (action === "confirm") {
+    state.players = {};
+    saveData(state);
+
+    await interaction.update({
+      content: "All tracked Skirmish players and deck submissions have been cleared.",
+      components: []
+    });
+  } else if (action === "cancel") {
+    await interaction.update({
+      content: "Clear action cancelled.",
+      components: []
+    });
+  }
+}
+
+// /skirmish list – show overview, with link on the right and no previews
 async function handleList(interaction) {
   if (!isMod(interaction)) {
     await interaction.reply({
@@ -442,14 +529,28 @@ async function handleList(interaction) {
     return;
   }
 
-  const lines = entries.map(([userId, player]) => {
-    const mention = `<@${userId}>`;
-    const name = player.displayName || "—";
+  const lines = [];
+
+  for (const [userId, player] of entries) {
+    let displayName = `ID: ${userId}`;
+    let mention = `<@${userId}>`;
+
+    // Try to get the user's current display name in the guild
+    const member = await interaction.guild.members.fetch(userId).catch(() => null);
+    if (member) {
+      displayName = member.displayName;
+      mention = member.toString(); // proper @name mention
+    }
+
+    const rpn = player.displayName || "—";
     const submitted = player.deckSubmitted ? "✅" : "❌";
     const reviewed = player.deckReviewed ? "✅" : "❌";
-    const link = player.deckLink || "—";
-    return `${mention} | RPN: ${name} | Submitted: ${submitted} | Reviewed: ${reviewed} | Link: ${link}`;
-  });
+    const linkDisplay = player.deckLink ? `\`${player.deckLink}\`` : "—"; // code formatting to suppress preview
+
+    lines.push(
+      `${mention} (${rpn}) | Submitted: ${submitted} | Reviewed: ${reviewed} | Link: ${linkDisplay}`
+    );
+  }
 
   const message = [
     "**Summoner Skirmish Deck Overview**",
