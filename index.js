@@ -31,7 +31,6 @@ const DATA_PATH = path.join(__dirname, "skirmish-data.json");
 function createEmptyPlayer() {
   return {
     displayName: null,
-    registered: false,
     deckLink: null,
     deckSubmitted: false,
     deckReviewed: false
@@ -45,20 +44,9 @@ function loadData() {
     const raw = fs.readFileSync(DATA_PATH, "utf8");
     const parsed = JSON.parse(raw);
 
-    // Backwards compatibility with older format
     const players = parsed.players && typeof parsed.players === "object"
       ? parsed.players
       : {};
-
-    // If old allowedUserIds exist, migrate them into players as registered users
-    if (Array.isArray(parsed.allowedUserIds)) {
-      for (const id of parsed.allowedUserIds) {
-        if (!players[id]) {
-          players[id] = createEmptyPlayer();
-        }
-        players[id].registered = true;
-      }
-    }
 
     return {
       submissionsChannelId: parsed.submissionsChannelId ?? null,
@@ -100,10 +88,9 @@ const client = new Client({
 // ---- Slash command definitions ----
 
 const commands = [
-  // Combined player command with subcommands: connect + submit
   new SlashCommandBuilder()
-    .setName("radskirmish")
-    .setDescription("Connect your RPN display name and submit your decklist.")
+    .setName("skirmish")
+    .setDescription("Skirmish tools: connect, submit, list, and manage decklists.")
     .addSubcommand(sub =>
       sub
         .setName("connect")
@@ -125,63 +112,52 @@ const commands = [
             .setDescription("Piltover Archive deck link")
             .setRequired(true)
         )
-    ),
-
-  // Mod command: set submissions channel
-  new SlashCommandBuilder()
-    .setName("skirmish-set-submissions")
-    .setDescription("Set the channel where decklists will be posted.")
-    .addChannelOption(opt =>
-      opt
-        .setName("channel")
-        .setDescription("Channel for decklist submissions")
-        .addChannelTypes(ChannelType.GuildText)
-        .setRequired(true)
-    ),
-
-  // Mod command: allow a player (mark them registered)
-  new SlashCommandBuilder()
-    .setName("skirmish-allow")
-    .setDescription("Mark a player as registered for this Summoner Skirmish.")
-    .addUserOption(opt =>
-      opt
-        .setName("user")
-        .setDescription("Player to mark as registered")
-        .setRequired(true)
-    ),
-
-  // Mod command: remove a player (unregister and clear their deck info)
-  new SlashCommandBuilder()
-    .setName("skirmish-remove")
-    .setDescription("Unregister a player and clear their deck submission.")
-    .addUserOption(opt =>
-      opt
-        .setName("user")
-        .setDescription("Player to remove")
-        .setRequired(true)
-    ),
-
-  // Mod command: mark deck as reviewed/unreviewed
-  new SlashCommandBuilder()
-    .setName("skirmish-reviewed")
-    .setDescription("Mark whether a player's decklist has been reviewed.")
-    .addUserOption(opt =>
-      opt
-        .setName("user")
-        .setDescription("Player")
-        .setRequired(true)
     )
-    .addBooleanOption(opt =>
-      opt
+    .addSubcommand(sub =>
+      sub
+        .setName("setsubmissions")
+        .setDescription("Set the channel where decklists will be posted. (Mods only)")
+        .addChannelOption(opt =>
+          opt
+            .setName("channel")
+            .setDescription("Channel for decklist submissions")
+            .addChannelTypes(ChannelType.GuildText)
+            .setRequired(true)
+        )
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName("list")
+        .setDescription("Show all known players and their deck submission / review status. (Mods only)")
+    )
+    .addSubcommand(sub =>
+      sub
         .setName("reviewed")
-        .setDescription("Has this player's deck been reviewed?")
-        .setRequired(true)
-    ),
-
-  // Mod command: list players + deck status
-  new SlashCommandBuilder()
-    .setName("skirmish-list")
-    .setDescription("Show all known players and their deck submission / review status.")
+        .setDescription("Mark whether a player's decklist has been reviewed. (Mods only)")
+        .addUserOption(opt =>
+          opt
+            .setName("user")
+            .setDescription("Player")
+            .setRequired(true)
+        )
+        .addBooleanOption(opt =>
+          opt
+            .setName("reviewed")
+            .setDescription("Has this player's deck been reviewed?")
+            .setRequired(true)
+        )
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName("remove")
+        .setDescription("Clear a player's deck submission. (Mods only)")
+        .addUserOption(opt =>
+          opt
+            .setName("user")
+            .setDescription("Player to remove submission for")
+            .setRequired(true)
+        )
+    )
 ].map(cmd => cmd.toJSON());
 
 // ---- Command registration ----
@@ -249,24 +225,28 @@ client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
   try {
-    switch (interaction.commandName) {
-      case "radskirmish":
-        await handleRadSkirmish(interaction);
+    if (interaction.commandName !== "skirmish") return;
+
+    const sub = interaction.options.getSubcommand();
+
+    switch (sub) {
+      case "connect":
+        await handleConnect(interaction);
         break;
-      case "skirmish-set-submissions":
+      case "submit":
+        await handleSubmit(interaction);
+        break;
+      case "setsubmissions":
         await handleSetSubmissions(interaction);
         break;
-      case "skirmish-allow":
-        await handleAllow(interaction);
+      case "list":
+        await handleList(interaction);
         break;
-      case "skirmish-remove":
-        await handleRemove(interaction);
-        break;
-      case "skirmish-reviewed":
+      case "reviewed":
         await handleReviewed(interaction);
         break;
-      case "skirmish-list":
-        await handleList(interaction);
+      case "remove":
+        await handleRemove(interaction);
         break;
       default:
         break;
@@ -282,16 +262,7 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 });
 
-// ---- Command logic: radskirmish (connect + submit) ----
-
-async function handleRadSkirmish(interaction) {
-  const sub = interaction.options.getSubcommand();
-  if (sub === "connect") {
-    await handleConnect(interaction);
-  } else if (sub === "submit") {
-    await handleSubmit(interaction);
-  }
-}
+// ---- Player-facing logic ----
 
 async function handleConnect(interaction) {
   const userId = interaction.user.id;
@@ -312,21 +283,10 @@ async function handleSubmit(interaction) {
   const link = interaction.options.getString("link", true).trim();
   const player = getOrCreatePlayer(userId);
 
-  // Require connect first
   if (!player.displayName) {
     await interaction.reply({
       content:
-        "You need to connect your Discord to your Riftbound Play Network Display Name first using `/radskirmish connect <Display Name>`.",
-      ephemeral: true
-    });
-    return;
-  }
-
-  // Require registration
-  if (!player.registered) {
-    await interaction.reply({
-      content:
-        "You are not registered for this Skirmish. If you think this is a mistake, talk to an organizer or judge.",
+        "You need to connect your Discord to your Riftbound Play Network Display Name first using `/skirmish connect <Display Name>`.",
       ephemeral: true
     });
     return;
@@ -334,7 +294,7 @@ async function handleSubmit(interaction) {
 
   if (!state.submissionsChannelId) {
     await interaction.reply({
-      content: "Decklist submissions channel has not been set up yet. Please ping an organizer.",
+      content: "Decklist submissions channel has not been set up yet. Please talk to an organizer or judge.",
       ephemeral: true
     });
     return;
@@ -343,13 +303,12 @@ async function handleSubmit(interaction) {
   const channel = await interaction.guild.channels.fetch(state.submissionsChannelId).catch(() => null);
   if (!channel || channel.type !== ChannelType.GuildText) {
     await interaction.reply({
-      content: "Configured submissions channel is invalid. Please ask a mod to run `/skirmish-set-submissions` again.",
+      content: "Configured submissions channel is invalid. Please ask an organizer to run `/skirmish setsubmissions` again.",
       ephemeral: true
     });
     return;
   }
 
-  // Update player state
   player.deckLink = link;
   player.deckSubmitted = true;
   player.deckReviewed = false;
@@ -408,75 +367,6 @@ async function handleSetSubmissions(interaction) {
   });
 }
 
-async function handleAllow(interaction) {
-  if (!isMod(interaction)) {
-    await interaction.reply({
-      content: "You don’t have permission to modify Skirmish registrations.",
-      ephemeral: true
-    });
-    return;
-  }
-
-  const user = interaction.options.getUser("user", true);
-  const player = getOrCreatePlayer(user.id);
-
-  player.registered = true;
-  saveData(state);
-
-  await interaction.reply({
-    content: `Marked <@${user.id}> as **registered** for this Summoner Skirmish.`,
-    ephemeral: true
-  });
-
-  try {
-    const dm = await user.createDM();
-    await dm.send(
-      "You have been registered for the upcoming Summoner Skirmish. " +
-        "Once you connect your Riftbound Play Network Display Name with `/radskirmish connect`, " +
-        "you can submit your deck with `/radskirmish submit`."
-    );
-  } catch {
-    // Ignore DM failures
-  }
-}
-
-async function handleRemove(interaction) {
-  if (!isMod(interaction)) {
-    await interaction.reply({
-      content: "You don’t have permission to modify Skirmish registrations.",
-      ephemeral: true
-    });
-    return;
-  }
-
-  const user = interaction.options.getUser("user", true);
-  const player = getOrCreatePlayer(user.id);
-
-  const wasRegistered = player.registered;
-  const hadDeck = player.deckSubmitted;
-
-  player.registered = false;
-  player.deckLink = null;
-  player.deckSubmitted = false;
-  player.deckReviewed = false;
-  saveData(state);
-
-  await interaction.reply({
-    content: `Unregistered <@${user.id}> and cleared their deck submission.${wasRegistered ? "" : " (They were not previously registered.)"}${hadDeck ? " (They had a deck submitted.)" : ""}`,
-    ephemeral: true
-  });
-
-  try {
-    const dm = await user.createDM();
-    await dm.send(
-      "You have been unregistered from the upcoming Summoner Skirmish, and your deck submission has been cleared. " +
-        "If you think this is an error, please contact an organizer or judge."
-    );
-  } catch {
-    // Ignore DM failures
-  }
-}
-
 async function handleReviewed(interaction) {
   if (!isMod(interaction)) {
     await interaction.reply({
@@ -492,7 +382,7 @@ async function handleReviewed(interaction) {
 
   if (!player.deckSubmitted) {
     await interaction.reply({
-      content: `<@${user.id}> has not submitted a decklist yet.`,
+      content: `${user} has not submitted a decklist yet.`,
       ephemeral: true
     });
     return;
@@ -502,7 +392,34 @@ async function handleReviewed(interaction) {
   saveData(state);
 
   await interaction.reply({
-    content: `Marked <@${user.id}>'s deck as **${reviewed ? "reviewed" : "not reviewed"}**.`,
+    content: `Marked ${user}'s deck as **${reviewed ? "reviewed" : "not reviewed"}**.`,
+    ephemeral: true
+  });
+}
+
+async function handleRemove(interaction) {
+  if (!isMod(interaction)) {
+    await interaction.reply({
+      content: "You don’t have permission to modify Skirmish submissions.",
+      ephemeral: true
+    });
+    return;
+  }
+
+  const user = interaction.options.getUser("user", true);
+  const player = getOrCreatePlayer(user.id);
+
+  const hadDeck = player.deckSubmitted || !!player.deckLink;
+
+  player.deckLink = null;
+  player.deckSubmitted = false;
+  player.deckReviewed = false;
+  saveData(state);
+
+  await interaction.reply({
+    content: hadDeck
+      ? `Cleared deck submission for ${user}.`
+      : `${user} did not have a deck submission recorded.`,
     ephemeral: true
   });
 }
@@ -525,22 +442,23 @@ async function handleList(interaction) {
     return;
   }
 
-  // Build a simple text table
-  const header = "Player | RPN Name | Deck Submitted | Deck Reviewed";
-  const separator = "------ | -------- | -------------- | -------------";
-
-  const rows = entries.map(([userId, player]) => {
-    const playerLabel = `<@${userId}>`;
+  const lines = entries.map(([userId, player]) => {
+    const mention = `<@${userId}>`;
     const name = player.displayName || "—";
     const submitted = player.deckSubmitted ? "✅" : "❌";
     const reviewed = player.deckReviewed ? "✅" : "❌";
-    return `${playerLabel} | ${name} | ${submitted} | ${reviewed}`;
+    const link = player.deckLink || "—";
+    return `${mention} | RPN: ${name} | Submitted: ${submitted} | Reviewed: ${reviewed} | Link: ${link}`;
   });
 
-  const table = ["```text", header, separator, ...rows, "```"].join("\n");
+  const message = [
+    "**Summoner Skirmish Deck Overview**",
+    "",
+    lines.join("\n")
+  ].join("\n");
 
   await interaction.reply({
-    content: table,
+    content: message,
     ephemeral: true
   });
 }
