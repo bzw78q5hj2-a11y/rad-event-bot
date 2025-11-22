@@ -26,6 +26,18 @@ const MOD_ROLE_IDS = [
 // Path for persistent data
 const DATA_PATH = path.join(__dirname, "skirmish-data.json");
 
+// ---- Types / defaults ----
+
+function createEmptyPlayer() {
+  return {
+    displayName: null,
+    registered: false,
+    deckLink: null,
+    deckSubmitted: false,
+    deckReviewed: false
+  };
+}
+
 // ---- Data helpers ----
 
 function loadData() {
@@ -33,16 +45,29 @@ function loadData() {
     const raw = fs.readFileSync(DATA_PATH, "utf8");
     const parsed = JSON.parse(raw);
 
+    // Backwards compatibility with older format
+    const players = parsed.players && typeof parsed.players === "object"
+      ? parsed.players
+      : {};
+
+    // If old allowedUserIds exist, migrate them into players as registered users
+    if (Array.isArray(parsed.allowedUserIds)) {
+      for (const id of parsed.allowedUserIds) {
+        if (!players[id]) {
+          players[id] = createEmptyPlayer();
+        }
+        players[id].registered = true;
+      }
+    }
+
     return {
       submissionsChannelId: parsed.submissionsChannelId ?? null,
-      allowedUserIds: Array.isArray(parsed.allowedUserIds) ? parsed.allowedUserIds : [],
-      pendingUserIds: Array.isArray(parsed.pendingUserIds) ? parsed.pendingUserIds : []
+      players
     };
   } catch (err) {
     return {
       submissionsChannelId: null,
-      allowedUserIds: [],
-      pendingUserIds: []
+      players: {}
     };
   }
 }
@@ -50,14 +75,20 @@ function loadData() {
 function saveData(data) {
   const safe = {
     submissionsChannelId: data.submissionsChannelId ?? null,
-    allowedUserIds: Array.isArray(data.allowedUserIds) ? data.allowedUserIds : [],
-    pendingUserIds: Array.isArray(data.pendingUserIds) ? data.pendingUserIds : []
+    players: data.players || {}
   };
 
   fs.writeFileSync(DATA_PATH, JSON.stringify(safe, null, 2), "utf8");
 }
 
 let state = loadData();
+
+function getOrCreatePlayer(userId) {
+  if (!state.players[userId]) {
+    state.players[userId] = createEmptyPlayer();
+  }
+  return state.players[userId];
+}
 
 // ---- Discord client ----
 
@@ -69,20 +100,34 @@ const client = new Client({
 // ---- Slash command definitions ----
 
 const commands = [
+  // Combined player command with subcommands: connect + submit
   new SlashCommandBuilder()
     .setName("radskirmish")
-    .setDescription("Submit your Piltover deck link for this Summoner Skirmish.")
-    .addStringOption(opt =>
-      opt
-        .setName("link")
-        .setDescription("Piltover Archive deck link")
-        .setRequired(true)
+    .setDescription("Connect your RPN display name and submit your decklist.")
+    .addSubcommand(sub =>
+      sub
+        .setName("connect")
+        .setDescription("Connect your Discord to your Riftbound Play Network Display Name.")
+        .addStringOption(opt =>
+          opt
+            .setName("display_name")
+            .setDescription("Your Riftbound Play Network Display Name")
+            .setRequired(true)
+        )
+    )
+    .addSubcommand(sub =>
+      sub
+        .setName("submit")
+        .setDescription("Submit your Piltover deck link for this Summoner Skirmish.")
+        .addStringOption(opt =>
+          opt
+            .setName("link")
+            .setDescription("Piltover Archive deck link")
+            .setRequired(true)
+        )
     ),
 
-  new SlashCommandBuilder()
-    .setName("skirmish-register")
-    .setDescription("Request to register for the next Summoner Skirmish."),
-
+  // Mod command: set submissions channel
   new SlashCommandBuilder()
     .setName("skirmish-set-submissions")
     .setDescription("Set the channel where decklists will be posted.")
@@ -94,29 +139,49 @@ const commands = [
         .setRequired(true)
     ),
 
+  // Mod command: allow a player (mark them registered)
   new SlashCommandBuilder()
-    .setName("skirmish-approve")
-    .setDescription("Approve a player for this Summoner Skirmish.")
+    .setName("skirmish-allow")
+    .setDescription("Mark a player as registered for this Summoner Skirmish.")
     .addUserOption(opt =>
       opt
         .setName("user")
-        .setDescription("Player to approve")
+        .setDescription("Player to mark as registered")
         .setRequired(true)
     ),
 
+  // Mod command: remove a player (unregister and clear their deck info)
   new SlashCommandBuilder()
-    .setName("skirmish-deny")
-    .setDescription("Deny a player / remove them from this Skirmish.")
+    .setName("skirmish-remove")
+    .setDescription("Unregister a player and clear their deck submission.")
     .addUserOption(opt =>
       opt
         .setName("user")
-        .setDescription("Player to deny / remove")
+        .setDescription("Player to remove")
         .setRequired(true)
     ),
 
+  // Mod command: mark deck as reviewed/unreviewed
+  new SlashCommandBuilder()
+    .setName("skirmish-reviewed")
+    .setDescription("Mark whether a player's decklist has been reviewed.")
+    .addUserOption(opt =>
+      opt
+        .setName("user")
+        .setDescription("Player")
+        .setRequired(true)
+    )
+    .addBooleanOption(opt =>
+      opt
+        .setName("reviewed")
+        .setDescription("Has this player's deck been reviewed?")
+        .setRequired(true)
+    ),
+
+  // Mod command: list players + deck status
   new SlashCommandBuilder()
     .setName("skirmish-list")
-    .setDescription("Show registered and pending players.")
+    .setDescription("Show all known players and their deck submission / review status.")
 ].map(cmd => cmd.toJSON());
 
 // ---- Command registration ----
@@ -128,7 +193,7 @@ async function registerCommands() {
 
   try {
     if (!clientId) {
-      console.error("DISCORD_CLIENT_ID is not set in .env – cannot register commands.");
+      console.error("DISCORD_CLIENT_ID is not set – cannot register commands.");
       return;
     }
 
@@ -188,17 +253,17 @@ client.on(Events.InteractionCreate, async interaction => {
       case "radskirmish":
         await handleRadSkirmish(interaction);
         break;
-      case "skirmish-register":
-        await handleRegister(interaction);
-        break;
       case "skirmish-set-submissions":
         await handleSetSubmissions(interaction);
         break;
-      case "skirmish-approve":
-        await handleApprove(interaction);
+      case "skirmish-allow":
+        await handleAllow(interaction);
         break;
-      case "skirmish-deny":
-        await handleDeny(interaction);
+      case "skirmish-remove":
+        await handleRemove(interaction);
+        break;
+      case "skirmish-reviewed":
+        await handleReviewed(interaction);
         break;
       case "skirmish-list":
         await handleList(interaction);
@@ -217,15 +282,51 @@ client.on(Events.InteractionCreate, async interaction => {
   }
 });
 
-// ---- Command logic ----
+// ---- Command logic: radskirmish (connect + submit) ----
 
 async function handleRadSkirmish(interaction) {
-  const userId = interaction.user.id;
-  const link = interaction.options.getString("link", true);
+  const sub = interaction.options.getSubcommand();
+  if (sub === "connect") {
+    await handleConnect(interaction);
+  } else if (sub === "submit") {
+    await handleSubmit(interaction);
+  }
+}
 
-  if (!state.allowedUserIds.includes(userId)) {
+async function handleConnect(interaction) {
+  const userId = interaction.user.id;
+  const displayName = interaction.options.getString("display_name", true).trim();
+
+  const player = getOrCreatePlayer(userId);
+  player.displayName = displayName;
+  saveData(state);
+
+  await interaction.reply({
+    content: `Your Discord is now linked to **${displayName}** on the Riftbound Play Network.`,
+    ephemeral: true
+  });
+}
+
+async function handleSubmit(interaction) {
+  const userId = interaction.user.id;
+  const link = interaction.options.getString("link", true).trim();
+  const player = getOrCreatePlayer(userId);
+
+  // Require connect first
+  if (!player.displayName) {
     await interaction.reply({
-      content: "You are not registered for this Skirmish.\nIf you think this is a mistake, try `/skirmish-register` or talk to a mod.",
+      content:
+        "You need to connect your Discord to your Riftbound Play Network Display Name first using `/radskirmish connect <Display Name>`.",
+      ephemeral: true
+    });
+    return;
+  }
+
+  // Require registration
+  if (!player.registered) {
+    await interaction.reply({
+      content:
+        "You are not registered for this Skirmish. If you think this is a mistake, talk to an organizer or judge.",
       ephemeral: true
     });
     return;
@@ -233,7 +334,7 @@ async function handleRadSkirmish(interaction) {
 
   if (!state.submissionsChannelId) {
     await interaction.reply({
-      content: "Decklist submissions channel has not been set up yet. Please ping a mod.",
+      content: "Decklist submissions channel has not been set up yet. Please ping an organizer.",
       ephemeral: true
     });
     return;
@@ -248,6 +349,12 @@ async function handleRadSkirmish(interaction) {
     return;
   }
 
+  // Update player state
+  player.deckLink = link;
+  player.deckSubmitted = true;
+  player.deckReviewed = false;
+  saveData(state);
+
   const looksLikePiltover =
     link.startsWith("https://") &&
     link.toLowerCase().includes("piltover");
@@ -257,6 +364,7 @@ async function handleRadSkirmish(interaction) {
     .setDescription(looksLikePiltover ? "Piltover Archive deck submitted." : "Deck link submitted.")
     .addFields(
       { name: "Player", value: `<@${userId}>`, inline: true },
+      { name: "RPN Display Name", value: player.displayName || "_not set_", inline: true },
       { name: "Link", value: link, inline: false }
     )
     .setTimestamp(new Date())
@@ -270,43 +378,7 @@ async function handleRadSkirmish(interaction) {
   });
 }
 
-async function handleRegister(interaction) {
-  const userId = interaction.user.id;
-
-  if (state.allowedUserIds.includes(userId)) {
-    await interaction.reply({
-      content: "You’re already registered for this Skirmish.",
-      ephemeral: true
-    });
-    return;
-  }
-
-  if (state.pendingUserIds.includes(userId)) {
-    await interaction.reply({
-      content: "Your registration is already pending approval.",
-      ephemeral: true
-    });
-    return;
-  }
-
-  state.pendingUserIds.push(userId);
-  saveData(state);
-
-  await interaction.reply({
-    content:
-      "Registration request sent. A mod will approve you if there’s space.\nYou’ll be able to submit your decklist with `/radskirmish` once approved.",
-    ephemeral: true
-  });
-
-  if (state.submissionsChannelId) {
-    const channel = await interaction.guild.channels.fetch(state.submissionsChannelId).catch(() => null);
-    if (channel && channel.type === ChannelType.GuildText) {
-      await channel.send(
-        `📝 **New registration request:** <@${userId}> wants to join the next Summoner Skirmish.\nMods can use \`/skirmish-approve\` or \`/skirmish-deny\`.`
-      );
-    }
-  }
-}
+// ---- Mod commands ----
 
 async function handleSetSubmissions(interaction) {
   if (!isMod(interaction)) {
@@ -336,106 +408,139 @@ async function handleSetSubmissions(interaction) {
   });
 }
 
-async function handleApprove(interaction) {
+async function handleAllow(interaction) {
   if (!isMod(interaction)) {
     await interaction.reply({
-      content: "You don’t have permission to approve players.",
+      content: "You don’t have permission to modify Skirmish registrations.",
       ephemeral: true
     });
     return;
   }
 
   const user = interaction.options.getUser("user", true);
-  const userId = user.id;
+  const player = getOrCreatePlayer(user.id);
 
-  const wasPending = state.pendingUserIds.includes(userId);
-  state.pendingUserIds = state.pendingUserIds.filter(id => id !== userId);
-
-  if (!state.allowedUserIds.includes(userId)) {
-    state.allowedUserIds.push(userId);
-  }
-
+  player.registered = true;
   saveData(state);
 
   await interaction.reply({
-    content: `Approved <@${userId}> for this Summoner Skirmish.${wasPending ? " (They were in the pending queue.)" : ""}`,
+    content: `Marked <@${user.id}> as **registered** for this Summoner Skirmish.`,
     ephemeral: true
   });
 
   try {
     const dm = await user.createDM();
     await dm.send(
-      "You’ve been approved for the upcoming Summoner Skirmish.\nYou can now submit your decklist with `/radskirmish <link>` in the server."
+      "You have been registered for the upcoming Summoner Skirmish. " +
+        "Once you connect your Riftbound Play Network Display Name with `/radskirmish connect`, " +
+        "you can submit your deck with `/radskirmish submit`."
     );
   } catch {
+    // Ignore DM failures
   }
 }
 
-async function handleDeny(interaction) {
+async function handleRemove(interaction) {
   if (!isMod(interaction)) {
     await interaction.reply({
-      content: "You don’t have permission to deny players.",
+      content: "You don’t have permission to modify Skirmish registrations.",
       ephemeral: true
     });
     return;
   }
 
   const user = interaction.options.getUser("user", true);
-  const userId = user.id;
+  const player = getOrCreatePlayer(user.id);
 
-  const wasPending = state.pendingUserIds.includes(userId);
-  const wasAllowed = state.allowedUserIds.includes(userId);
+  const wasRegistered = player.registered;
+  const hadDeck = player.deckSubmitted;
 
-  state.pendingUserIds = state.pendingUserIds.filter(id => id !== userId);
-  state.allowedUserIds = state.allowedUserIds.filter(id => id !== userId);
+  player.registered = false;
+  player.deckLink = null;
+  player.deckSubmitted = false;
+  player.deckReviewed = false;
   saveData(state);
 
-  if (!wasPending && !wasAllowed) {
-    await interaction.reply({
-      content: `<@${userId}> was not in the pending or allowed lists.`,
-      ephemeral: true
-    });
-    return;
-  }
-
   await interaction.reply({
-    content: `Removed <@${userId}> from this Summoner Skirmish.${wasPending ? " (They were pending.)" : ""}${wasAllowed ? " (They were previously approved.)" : ""}`,
+    content: `Unregistered <@${user.id}> and cleared their deck submission.${wasRegistered ? "" : " (They were not previously registered.)"}${hadDeck ? " (They had a deck submitted.)" : ""}`,
     ephemeral: true
   });
 
   try {
     const dm = await user.createDM();
     await dm.send(
-      "Your registration for the upcoming Summoner Skirmish was declined or removed. " +
-        "If you think this is an error, please contact a moderator."
+      "You have been unregistered from the upcoming Summoner Skirmish, and your deck submission has been cleared. " +
+        "If you think this is an error, please contact an organizer or judge."
     );
   } catch {
+    // Ignore DM failures
   }
+}
+
+async function handleReviewed(interaction) {
+  if (!isMod(interaction)) {
+    await interaction.reply({
+      content: "You don’t have permission to mark deck reviews.",
+      ephemeral: true
+    });
+    return;
+  }
+
+  const user = interaction.options.getUser("user", true);
+  const reviewed = interaction.options.getBoolean("reviewed", true);
+  const player = getOrCreatePlayer(user.id);
+
+  if (!player.deckSubmitted) {
+    await interaction.reply({
+      content: `<@${user.id}> has not submitted a decklist yet.`,
+      ephemeral: true
+    });
+    return;
+  }
+
+  player.deckReviewed = reviewed;
+  saveData(state);
+
+  await interaction.reply({
+    content: `Marked <@${user.id}>'s deck as **${reviewed ? "reviewed" : "not reviewed"}**.`,
+    ephemeral: true
+  });
 }
 
 async function handleList(interaction) {
   if (!isMod(interaction)) {
     await interaction.reply({
-      content: "You don’t have permission to view the Skirmish lists.",
+      content: "You don’t have permission to view Skirmish lists.",
       ephemeral: true
     });
     return;
   }
 
-  const allowed = state.allowedUserIds.map(id => `<@${id}>`).join("\n") || "_none_";
-  const pending = state.pendingUserIds.map(id => `<@${id}>`).join("\n") || "_none_";
+  const entries = Object.entries(state.players);
+  if (entries.length === 0) {
+    await interaction.reply({
+      content: "No players are known to the bot yet.",
+      ephemeral: true
+    });
+    return;
+  }
 
-  const embed = new EmbedBuilder()
-    .setTitle("Summoner Skirmish Registration")
-    .addFields(
-      { name: "Approved players", value: allowed, inline: false },
-      { name: "Pending requests", value: pending, inline: false }
-    )
-    .setColor(0x6a4c93)
-    .setTimestamp(new Date());
+  // Build a simple text table
+  const header = "Player | RPN Name | Deck Submitted | Deck Reviewed";
+  const separator = "------ | -------- | -------------- | -------------";
+
+  const rows = entries.map(([userId, player]) => {
+    const playerLabel = `<@${userId}>`;
+    const name = player.displayName || "—";
+    const submitted = player.deckSubmitted ? "✅" : "❌";
+    const reviewed = player.deckReviewed ? "✅" : "❌";
+    return `${playerLabel} | ${name} | ${submitted} | ${reviewed}`;
+  });
+
+  const table = ["```text", header, separator, ...rows, "```"].join("\n");
 
   await interaction.reply({
-    embeds: [embed],
+    content: table,
     ephemeral: true
   });
 }
