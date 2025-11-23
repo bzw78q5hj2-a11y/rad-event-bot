@@ -23,7 +23,7 @@ const path = require("path");
 
 // Optional: role IDs allowed to run mod commands in addition to Manage Guild permission.
 const MOD_ROLE_IDS = [
-  // "1431337802368417854"
+  // "123456789012345678"
 ];
 
 // Path for persistent data
@@ -108,7 +108,7 @@ const commands = [
     .addSubcommand(sub =>
       sub
         .setName("submit")
-        .setDescription("Submit your Piltover Archive deck link for this Summoner Skirmish.")
+        .setDescription("Submit your Piltover deck link for this Summoner Skirmish.")
         .addStringOption(opt =>
           opt
             .setName("link")
@@ -342,7 +342,20 @@ async function handleSubmit(interaction) {
     .setTimestamp(new Date())
     .setColor(0xffc857);
 
-  await channel.send({ embeds: [embed] });
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`skirmish_review_approve_${userId}`)
+      .setLabel("Approve")
+      .setEmoji("✅")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`skirmish_review_deny_${userId}`)
+      .setLabel("Deny")
+      .setEmoji("❌")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await channel.send({ embeds: [embed], components: [row] });
 
   await interaction.reply({
     content: "Decklist received. Good luck, Summoner.",
@@ -406,7 +419,7 @@ async function handleReviewed(interaction) {
 
   await interaction.reply({
     content: `Marked ${user}'s deck as **${reviewed ? "reviewed" : "not reviewed"}**.`,
-    ephemeral: true
+      ephemeral: true
   });
 }
 
@@ -468,45 +481,96 @@ async function handleClear(interaction) {
   });
 }
 
-// Handle clear confirmation buttons
+// Handle button interactions (clear + approve/deny)
 async function handleButton(interaction) {
   const id = interaction.customId;
 
-  if (!id.startsWith("skirmish_clear_")) return;
+  // Clear confirmation buttons
+  if (id.startsWith("skirmish_clear_")) {
+    const parts = id.split("_"); // ["skirmish","clear","confirm/cancel","<userId>"]
+    const action = parts[2];
+    const ownerId = parts[3];
 
-  const parts = id.split("_"); // ["skirmish","clear","confirm","<userId>"]
-  const action = parts[2];
-  const ownerId = parts[3];
+    if (interaction.user.id !== ownerId) {
+      await interaction.reply({
+        content: "You didn’t start this clear action.",
+        ephemeral: true
+      });
+      return;
+    }
 
-  if (interaction.user.id !== ownerId) {
-    await interaction.reply({
-      content: "You didn’t start this clear action.",
-      ephemeral: true
-    });
+    if (!isMod(interaction)) {
+      await interaction.reply({
+        content: "You don’t have permission to clear Skirmish data.",
+        ephemeral: true
+      });
+      return;
+    }
+
+    if (action === "confirm") {
+      state.players = {};
+      saveData(state);
+
+      await interaction.update({
+        content: "All tracked Skirmish players and deck submissions have been cleared.",
+        components: []
+      });
+    } else if (action === "cancel") {
+      await interaction.update({
+        content: "Clear action cancelled.",
+        components: []
+      });
+    }
+
     return;
   }
 
-  if (!isMod(interaction)) {
-    await interaction.reply({
-      content: "You don’t have permission to clear Skirmish data.",
-      ephemeral: true
-    });
+  // Approve / deny buttons on decklist submissions
+  if (id.startsWith("skirmish_review_")) {
+    if (!isMod(interaction)) {
+      await interaction.reply({
+        content: "You don’t have permission to review or deny decklists.",
+        ephemeral: true
+      });
+      return;
+    }
+
+    const parts = id.split("_"); // ["skirmish","review","approve/deny","<userId>"]
+    const action = parts[2];
+    const targetUserId = parts[3];
+
+    const player = state.players[targetUserId];
+
+    if (!player) {
+      await interaction.update({
+        content: "This decklist entry no longer exists in the Skirmish data.",
+        components: [],
+        embeds: interaction.message.embeds
+      });
+      return;
+    }
+
+    if (action === "approve") {
+      player.deckReviewed = true;
+      saveData(state);
+
+      await interaction.update({
+        content: `✅ Decklist approved by ${interaction.user}.`,
+        components: [],
+        embeds: interaction.message.embeds
+      });
+    } else if (action === "deny") {
+      delete state.players[targetUserId];
+      saveData(state);
+
+      await interaction.update({
+        content: `❌ Decklist denied and removed by ${interaction.user}.`,
+        components: [],
+        embeds: interaction.message.embeds
+      });
+    }
+
     return;
-  }
-
-  if (action === "confirm") {
-    state.players = {};
-    saveData(state);
-
-    await interaction.update({
-      content: "All tracked Skirmish players and deck submissions have been cleared.",
-      components: []
-    });
-  } else if (action === "cancel") {
-    await interaction.update({
-      content: "Clear action cancelled.",
-      components: []
-    });
   }
 }
 
@@ -535,17 +599,16 @@ async function handleList(interaction) {
     let displayName = `ID: ${userId}`;
     let mention = `<@${userId}>`;
 
-    // Try to get the user's current display name in the guild
     const member = await interaction.guild.members.fetch(userId).catch(() => null);
     if (member) {
       displayName = member.displayName;
-      mention = member.toString(); // proper @name mention
+      mention = member.toString();
     }
 
     const rpn = player.displayName || "—";
     const submitted = player.deckSubmitted ? "✅" : "❌";
     const reviewed = player.deckReviewed ? "✅" : "❌";
-    const linkDisplay = player.deckLink ? `\`${player.deckLink}\`` : "—"; // code formatting to suppress preview
+    const linkDisplay = player.deckLink ? `\`${player.deckLink}\`` : "—";
 
     lines.push(
       `${mention} (${rpn}) | Submitted: ${submitted} | Reviewed: ${reviewed} | Link: ${linkDisplay}`
